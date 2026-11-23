@@ -118,6 +118,25 @@ Because CLI harnesses invoked with a single prompt are stateless per call, `harn
 - **Error hygiene**: Failed or interrupted agent invocations (non-zero exit status) are not added to conversation history.
 - **Reset**: Run `!clear` to clear both the terminal screen and the retained conversation.
 
+### Line Editing & Command History
+
+In interactive sessions, `harnesh` provides terminal line editing and persistent command history (`~/.harnesh_history`) with zero external dependencies:
+
+| Shortcut | Action |
+|---|---|
+| `↑` / `↓` (or `Ctrl-P` / `Ctrl-N`) | Navigate previous / next commands in history (preserving your current draft) |
+| `←` / `→` (or `Ctrl-B` / `Ctrl-F`) | Move cursor left / right within the current line |
+| `Option` / `Ctrl` + `←` / `→` (or `Alt-B` / `Alt-F`) | Jump backward / forward by word |
+| `Home` / `End` (or `Ctrl-A` / `Ctrl-E`) | Jump to start / end of line |
+| `Backspace` / `Delete` | Delete character before / at cursor |
+| `Ctrl-U` / `Ctrl-K` | Delete to start / end of line |
+| `Ctrl-W` / `Option-Backspace` | Delete previous word |
+| `Ctrl-L` | Clear screen and redraw current prompt and input (keeps conversation) |
+| `Ctrl-C` | Cancel current input line (or interrupt a running agent / `!command`) |
+| `Ctrl-D` | Exit on empty line (or delete character at cursor if non-empty) |
+
+Raw terminal mode is only active while editing a prompt and is always restored before executing any agent call or `!command`, so full-screen tools like `!vim` and `!less` work normally.
+
 ### Input Routing Reference
 
 | Input | Behavior |
@@ -168,8 +187,13 @@ printf "Remember the number 42\nWhat number did I ask you to remember?\n" | ./ha
 │       ├── command_test.go           # Unit tests for command parsing & prompt placement
 │       ├── conversation.go           # Multi-turn conversation history & ANSI stripping
 │       ├── conversation_test.go      # Unit tests for conversation formatting & ANSI stripping
+│       ├── lineeditor.go             # Interactive line editor, arrow history & ~/.harnesh_history
+│       ├── lineeditor_test.go        # Unit tests for arrow keys, shortcuts & history persistence
 │       ├── prompt.go                 # Original shell detection, PS1 expansion & color inheritance
 │       ├── prompt_test.go            # Unit tests for zsh/bash PS1 rendering & color preservation
+│       ├── rawmode_darwin.go         # macOS termios raw terminal mode
+│       ├── rawmode_linux.go          # Linux termios raw terminal mode
+│       ├── rawmode_other.go          # Fallback stub for other platforms
 │       ├── shell.go                  # Core REPL, !command dispatch, !cd/!clear/!exit built-ins
 │       └── shell_test.go             # Unit & integration tests for the shell loop
 ├── docs/

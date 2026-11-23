@@ -53,6 +53,11 @@ type Config struct {
 	// PS1 optionally overrides the prompt template instead of reading PS1 from
 	// the environment or probing the original shell.
 	PS1 string
+
+	// HistoryFile optionally specifies a file path for loading and persisting
+	// interactive command history (e.g., ~/.harnesh_history). When empty,
+	// command history is retained in memory for the current session only.
+	HistoryFile string
 }
 
 // EvalResult describes the outcome of evaluating a single input line.
@@ -71,6 +76,7 @@ type EvalResult struct {
 type Shell struct {
 	cfg          Config
 	prompt       *PromptRenderer
+	editor       *LineEditor
 	conversation Conversation
 	lastExitCode int
 	prevDir      string
@@ -95,22 +101,32 @@ func New(cfg Config) (*Shell, error) {
 		cfg.SystemShell = DetectOriginalShell()
 	}
 
-	return &Shell{
+	sh := &Shell{
 		cfg:     cfg,
 		prompt:  NewPromptRenderer(cfg.SystemShell, cfg.PS1, cfg.Interactive),
 		prevDir: os.Getenv("OLDPWD"),
-	}, nil
+	}
+	if cfg.Interactive {
+		sh.editor = NewLineEditor(cfg.In, cfg.Out, cfg.HistoryFile)
+	}
+	return sh, nil
 }
 
 // Run starts the read-eval-print loop and blocks until EOF, !exit, or ctx
 // cancellation. It returns the shell's final exit code.
 func (s *Shell) Run(ctx context.Context) int {
 	if s.cfg.Interactive {
-		fmt.Fprintf(s.cfg.Out, "harnesh — agent harness: %s\n", s.cfg.Harness.String())
-		fmt.Fprintln(s.cfg.Out, "Enter a prompt for the agent, !<command> for the shell, !clear to reset, or !exit / Ctrl-D to quit.")
+		return s.runInteractive(ctx)
 	}
+	return s.runNonInteractive(ctx)
+}
 
-	reader := bufio.NewReader(s.cfg.In)
+// runInteractive drives the TTY REPL using LineEditor for arrow-key history
+// navigation and inline cursor editing.
+func (s *Shell) runInteractive(ctx context.Context) int {
+	fmt.Fprintf(s.cfg.Out, "harnesh — agent harness: %s\n", s.cfg.Harness.String())
+	fmt.Fprintln(s.cfg.Out, "Enter a prompt for the agent, !<command> for the shell, !clear to reset, or !exit / Ctrl-D to quit.")
+
 	var cachedPrompt string
 	promptDirty := true
 
@@ -119,12 +135,44 @@ func (s *Shell) Run(ctx context.Context) int {
 			return s.lastExitCode
 		}
 
-		if s.cfg.Interactive {
-			if promptDirty {
-				cachedPrompt = s.Prompt(ctx)
-				promptDirty = false
+		if promptDirty {
+			cachedPrompt = s.Prompt(ctx)
+			promptDirty = false
+		}
+
+		line, err := s.editor.ReadLine(cachedPrompt)
+		if errors.Is(err, ErrInterrupted) {
+			s.lastExitCode = 130
+			promptDirty = true
+			continue
+		}
+		if errors.Is(err, io.EOF) {
+			return s.lastExitCode
+		}
+		if err != nil {
+			fmt.Fprintf(s.cfg.Err, "harnesh: read error: %v\n", err)
+			return 1
+		}
+
+		if strings.TrimSpace(line) != "" {
+			s.editor.AddHistory(line)
+			res := s.EvalLine(ctx, line)
+			if res.ShouldExit {
+				return res.ExitCode
 			}
-			fmt.Fprint(s.cfg.Out, cachedPrompt)
+			promptDirty = true
+		}
+	}
+}
+
+// runNonInteractive drives the REPL for piped or scripted input without raw
+// terminal mode or prompt output.
+func (s *Shell) runNonInteractive(ctx context.Context) int {
+	reader := bufio.NewReader(s.cfg.In)
+
+	for {
+		if ctx.Err() != nil {
+			return s.lastExitCode
 		}
 
 		line, err := reader.ReadString('\n')
@@ -138,13 +186,9 @@ func (s *Shell) Run(ctx context.Context) int {
 			if res.ShouldExit {
 				return res.ExitCode
 			}
-			promptDirty = true
 		}
 
 		if errors.Is(err, io.EOF) {
-			if s.cfg.Interactive {
-				fmt.Fprintln(s.cfg.Out)
-			}
 			return s.lastExitCode
 		}
 	}
@@ -321,7 +365,9 @@ func (s *Shell) runExternalShellCommand(ctx context.Context, cmdLine string) {
 	cmd.Stdout = s.cfg.Out
 	cmd.Stderr = s.cfg.Err
 	if s.cfg.Interactive {
-		cmd.Stdin = s.cfg.In
+		if f, ok := s.cfg.In.(*os.File); ok {
+			cmd.Stdin = f
+		}
 	}
 	if extra := s.prompt.ColorEnv(); len(extra) > 0 {
 		cmd.Env = append(os.Environ(), extra...)

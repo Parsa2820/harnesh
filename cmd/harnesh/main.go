@@ -92,12 +92,18 @@ func run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer
 		return 2
 	}
 
+	var historyFile string
+	if interactive {
+		historyFile = shell.DefaultHistoryFile()
+	}
+
 	sh, err := shell.New(shell.Config{
 		Harness:     harness,
 		In:          in,
 		Out:         out,
 		Err:         errOut,
 		Interactive: interactive,
+		HistoryFile: historyFile,
 	})
 	if err != nil {
 		fmt.Fprintf(errOut, "harnesh: %v\n", err)

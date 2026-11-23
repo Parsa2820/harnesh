@@ -12,6 +12,7 @@ This document explains how `harnesh` is structured, why key design decisions wer
 2. **`internal/shell`** — Owns all shell semantics, kept fully decoupled from process globals (`os.Stdin`/`os.Stdout`/`os.Stderr` are injected through `shell.Config`) so the REPL can be tested deterministically in-process:
    - `command.go` — Parses the single `<agent-command>` argument into a `HarnessCommand` and builds safe `argv` slices for each prompt.
    - `conversation.go` — Stores multi-turn prompt/response history (`Conversation`), strips ANSI sequences from stored responses (`StripANSI`), and formats context-enriched prompts for stateless CLI harnesses.
+   - `lineeditor.go` + `rawmode_{darwin,linux,other}.go` — Interactive ANSI/UTF-8 line editor (`LineEditor`) providing `↑`/`↓` command history navigation (persisted to `~/.harnesh_history`), `←`/`→` cursor editing, word navigation, and kill-line shortcuts with raw terminal mode scoped strictly to `ReadLine`.
    - `prompt.go` — Detects the original shell (`DetectOriginalShell`), probes unexported `PS1` and color variables once at startup, and renders `PS1` dynamically with ANSI colors, working directory, and last exit status (`PromptRenderer`).
    - `shell.go` — Implements the REPL (`Shell.Run`), line router (`Shell.EvalLine`), in-process built-ins (`!cd`, `!clear`, `!exit`), external shell command runner, and agent invocation runner.
 
@@ -121,6 +122,7 @@ All other `!command` lines are delegated to `<original-shell> -c <command>` with
 
 - **`internal/shell/command_test.go`**: Unit tests for `SplitArgs` (quoting, escaping, malformed inputs) and `ParseHarnessCommand` / `BuildArgs`.
 - **`internal/shell/conversation_test.go`**: Unit tests for multi-turn formatting, `Clear()`, and `StripANSI` (CSI and OSC sequences).
+- **`internal/shell/lineeditor_test.go`**: Unit tests for arrow-key history navigation, draft preservation, horizontal cursor editing, Unicode backspace, kill shortcuts, `Ctrl-C`/`Ctrl-D`, and persistent history file reload.
 - **`internal/shell/prompt_test.go`**: Unit tests for `ExpandBashPS1`, live `zsh` colored `PS1` + exit-status conditional rendering, and sentinel extraction.
 - **`internal/shell/shell_test.go`**: Integration tests covering prompt/shell dispatch, multi-turn conversation retention, `!clear` resetting both screen and history, `!cd`, `!exit`, failed-turn isolation, and custom colored `PS1`.
 - **`cmd/harnesh/main_test.go`**: End-to-end CLI argument and session tests via `run`.
@@ -129,7 +131,7 @@ All other `!command` lines are delegated to `<original-shell> -c <command>` with
 
 ## Potential Future Extensions
 
-- **Line editing & persistent history**: Swap `bufio.Reader` for a readline/terminal line editor (arrow keys, Ctrl-R reverse search, `~/.harnesh_history`).
+- **Reverse incremental history search (`Ctrl-R`)**: Interactive substring search through `~/.harnesh_history`.
 - **Multi-line prompts**: Support trailing `\` continuation or fenced multi-line input blocks.
 - **Context truncation / compaction**: Automatically trim or summarize very long conversations before approaching OS `ARG_MAX`.
 - **Shell-to-agent context piping**: Optional opt-in sharing of recent `!command` outputs with the agent.

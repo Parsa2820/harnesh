@@ -276,6 +276,41 @@ func TestShellUsesConfiguredPS1WithColors(t *testing.T) {
 	}
 }
 
+func TestShellInteractiveArrowHistoryRecall(t *testing.T) {
+	hc, err := ParseHarnessCommand(`printf "AI:%s\n"`)
+	if err != nil {
+		t.Fatalf("ParseHarnessCommand: %v", err)
+	}
+
+	// Run "!echo first", then recall it with Up arrow, edit to "!echo first2",
+	// and exit with Ctrl-D.
+	input := "!echo first\r" + "\x1b[A2\r" + "\x04"
+
+	var outBuf, errBuf bytes.Buffer
+	sh, err := New(Config{
+		Harness:     hc,
+		In:          strings.NewReader(input),
+		Out:         &outBuf,
+		Err:         &errBuf,
+		Interactive: true,
+		SystemShell: "/bin/sh",
+		PS1:         "$ ",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	code := sh.Run(context.Background())
+	if code != 0 {
+		t.Fatalf("Run exited with %d, stderr=%q", code, errBuf.String())
+	}
+
+	out := outBuf.String()
+	if !strings.Contains(out, "first\n") || !strings.Contains(out, "first2\n") {
+		t.Fatalf("expected recalled & edited command output in:\n%q", out)
+	}
+}
+
 func TestHasUnquotedShellOperators(t *testing.T) {
 	tests := []struct {
 		input string
