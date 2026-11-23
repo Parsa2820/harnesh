@@ -58,3 +58,19 @@ func TestExtractBetween(t *testing.T) {
 		t.Fatalf("extractBetween = %q, want %q", got, want)
 	}
 }
+
+func TestStripReadlineBracketsAndNeedsInteractive(t *testing.T) {
+	// Bash 4.4+ ${PS1@P} converts \[ and \] to \x01 and \x02.
+	in := "\x01\x1b[35m\x02custom:shell\x01\x1b[0m\x02 $ "
+	want := "\x1b[35mcustom:shell\x1b[0m $ "
+	if got := stripReadlineBrackets(in); got != want {
+		t.Fatalf("stripReadlineBrackets = %q, want %q", got, want)
+	}
+
+	if ps1NeedsInteractiveShell(`\[\033[35m\]custom:\W\[\033[0m\] \$ `) {
+		t.Fatal("escaped \\$ should not require an interactive subshell")
+	}
+	if !ps1NeedsInteractiveShell(`%F{magenta}$(git_branch_name)%f %# `) {
+		t.Fatal("$(...) command substitution should require an interactive subshell")
+	}
+}

@@ -339,14 +339,20 @@ func probeOriginalShell(shellPath, shellKind string, needPS1 bool) (string, []st
 	return ps1, extraEnv
 }
 
-// ps1NeedsInteractiveShell reports whether rawPS1 contains command or variable
-// substitutions that may depend on functions or options defined in shell rc
-// files.
+// ps1NeedsInteractiveShell reports whether rawPS1 contains unescaped command or
+// variable substitutions that may depend on functions or options defined in
+// shell rc files. Escaped "\$" (Bash's root/user prompt sigil) does not require
+// an interactive subshell.
 func ps1NeedsInteractiveShell(rawPS1 string) bool {
-	return strings.Contains(rawPS1, "$(") ||
-		strings.Contains(rawPS1, "`") ||
-		strings.Contains(rawPS1, "${") ||
-		strings.Contains(rawPS1, "$")
+	for i := 0; i < len(rawPS1); i++ {
+		switch rawPS1[i] {
+		case '\\':
+			i++ // Skip escaped character (e.g., \$ or \`).
+		case '$', '`':
+			return true
+		}
+	}
+	return false
 }
 
 // extractBetween returns the substring between the last occurrence of start and
@@ -468,13 +474,16 @@ func ExpandBashPS1(ps1 string, lastExitCode int) string {
 	}
 
 	_ = lastExitCode
-	return b.String()
+	return stripReadlineBrackets(b.String())
 }
 
-// stripReadlineBrackets removes literal \[ and \] wrappers if present.
+// stripReadlineBrackets removes literal \[ and \] wrappers as well as Bash
+// ${PS1@P} readline non-printing markers (\x01 and \x02).
 func stripReadlineBrackets(s string) string {
 	s = strings.ReplaceAll(s, `\[`, "")
 	s = strings.ReplaceAll(s, `\]`, "")
+	s = strings.ReplaceAll(s, "\x01", "")
+	s = strings.ReplaceAll(s, "\x02", "")
 	return s
 }
 
