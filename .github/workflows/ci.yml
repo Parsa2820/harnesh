@@ -6,9 +6,17 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -19,11 +27,38 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
       - name: Vet
         run: go vet ./...
 
       - name: Test
-        run: go test -v -race ./...
+        run: go test -race ./...
 
       - name: Build
         run: go build ./cmd/harnesh
+
+  cross-build:
+    # The terminal layer is platform-specific; make sure every supported
+    # target (and the stub fallback) keeps compiling.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vet all targets
+        run: |
+          for target in linux/arm64 darwin/arm64 freebsd/amd64 openbsd/amd64 netbsd/amd64 windows/amd64; do
+            echo "== $target"
+            GOOS="${target%/*}" GOARCH="${target#*/}" go vet ./...
+          done
