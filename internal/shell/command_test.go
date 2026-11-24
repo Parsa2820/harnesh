@@ -128,6 +128,32 @@ func TestParseHarnessCommandAndBuildArgs(t *testing.T) {
 		}
 	})
 
+	t.Run("a prompt starting with a dash cannot become a harness option", func(t *testing.T) {
+		tests := []struct {
+			harness string
+			prompt  string
+			want    []string
+		}{
+			{"claude -p", "-h what does this flag do?", []string{"-p", " -h what does this flag do?"}},
+			{"claude -p", "--version", []string{"-p", " --version"}},
+			{"agent --prompt {} --json", "-5 degrees in F?", []string{"--prompt", " -5 degrees in F?", "--json"}},
+			{"agent {}suffix", "-x", []string{" -xsuffix"}},
+			// Embedded in an option value: the dash is not at the start.
+			{"agent --prompt={}", "-x", []string{"--prompt=-x"}},
+			// Dashes elsewhere are untouched.
+			{"claude -p", "rename foo-bar - quickly", []string{"-p", "rename foo-bar - quickly"}},
+		}
+		for _, tc := range tests {
+			hc, err := ParseHarnessCommand(tc.harness)
+			if err != nil {
+				t.Fatalf("ParseHarnessCommand(%q): %v", tc.harness, err)
+			}
+			if got := hc.BuildArgs(tc.prompt); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("%q with prompt %q: BuildArgs = %#v, want %#v", tc.harness, tc.prompt, got, tc.want)
+			}
+		}
+	})
+
 	t.Run("rejects empty command", func(t *testing.T) {
 		if _, err := ParseHarnessCommand("   "); err == nil {
 			t.Fatal("expected error for empty harness command")

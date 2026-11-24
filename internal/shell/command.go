@@ -53,23 +53,43 @@ func ParseHarnessCommand(raw string) (*HarnessCommand, error) {
 // element rather than interpolated into a shell string, prompts containing
 // quotes, whitespace, or shell metacharacters are delivered safely without
 // escaping issues.
+//
+// A prompt that begins with "-" would otherwise put a dash at the start of an
+// argument, where the harness would parse it as one of its own options (a
+// prompt such as "-h what does this flag do?" would print the harness's help).
+// Such an argument is given a leading space, which keeps it positional for
+// every argument parser and is insignificant to the agent. Inserting "--"
+// instead is not an option because not every harness accepts it.
 func (h *HarnessCommand) BuildArgs(prompt string) []string {
 	out := make([]string, 0, len(h.Args)+1)
 	substituted := false
 
 	for _, arg := range h.Args {
-		if strings.Contains(arg, PromptPlaceholder) {
-			out = append(out, strings.ReplaceAll(arg, PromptPlaceholder, prompt))
-			substituted = true
-		} else {
+		if !strings.Contains(arg, PromptPlaceholder) {
 			out = append(out, arg)
+			continue
 		}
+		substituted = true
+		value := strings.ReplaceAll(arg, PromptPlaceholder, prompt)
+		if strings.HasPrefix(arg, PromptPlaceholder) {
+			value = guardLeadingDash(value)
+		}
+		out = append(out, value)
 	}
 
 	if !substituted {
-		out = append(out, prompt)
+		out = append(out, guardLeadingDash(prompt))
 	}
 	return out
+}
+
+// guardLeadingDash keeps an argument made of user text from being parsed as a
+// command-line option.
+func guardLeadingDash(arg string) string {
+	if strings.HasPrefix(arg, "-") {
+		return " " + arg
+	}
+	return arg
 }
 
 // String returns the original raw harness command string.
