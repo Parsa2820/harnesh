@@ -49,32 +49,65 @@ func (c *Conversation) Turns() []Turn {
 	return out
 }
 
+const (
+	historyHeader        = "Conversation history:\n\n"
+	historyHeaderTrimmed = "Conversation history (earlier turns omitted):\n\n"
+	currentMessageHeader = "Current user message:\n"
+)
+
 // FormatPrompt builds the prompt string to pass to the CLI harness for
 // currentPrompt. When no prior turns exist, currentPrompt is returned
 // unchanged. Otherwise, prior turns are formatted ahead of currentPrompt so
-// the agent has full conversation context.
-func (c *Conversation) FormatPrompt(currentPrompt string) string {
-	if len(c.turns) == 0 {
-		return currentPrompt
+// the agent has the conversation context.
+//
+// If maxBytes is positive and the full transcript would exceed it, the oldest
+// turns are left out until the prompt fits; omitted reports how many. The
+// current prompt itself is never shortened.
+func (c *Conversation) FormatPrompt(currentPrompt string, maxBytes int) (prompt string, omitted int) {
+	// Walk backwards from the newest turn to find how many fit the budget.
+	first := 0
+	if maxBytes > 0 {
+		size := len(historyHeaderTrimmed) + len(currentMessageHeader) + len(currentPrompt)
+		first = len(c.turns)
+		for first > 0 {
+			size += c.turns[first-1].formattedLen()
+			if size > maxBytes {
+				break
+			}
+			first--
+		}
+	}
+	omitted = first
+	turns := c.turns[first:]
+	if len(turns) == 0 {
+		return currentPrompt, omitted
 	}
 
 	var b strings.Builder
-	b.WriteString("Conversation history:\n\n")
-	for _, t := range c.turns {
+	if omitted > 0 {
+		b.WriteString(historyHeaderTrimmed)
+	} else {
+		b.WriteString(historyHeader)
+	}
+	for _, t := range turns {
 		b.WriteString("User: ")
 		b.WriteString(t.Prompt)
-		b.WriteByte('\n')
-		b.WriteString("Assistant: ")
+		b.WriteString("\nAssistant: ")
 		b.WriteString(t.Response)
 		b.WriteString("\n\n")
 	}
-	b.WriteString("Current user message:\n")
+	b.WriteString(currentMessageHeader)
 	b.WriteString(currentPrompt)
-	return b.String()
+	return b.String(), omitted
 }
 
-// StripANSI removes common ANSI terminal escape sequences (CSI, OSC, and
-// two-byte ESC sequences) from s.
+// formattedLen is the number of bytes t occupies in a formatted prompt.
+func (t Turn) formattedLen() int {
+	return len("User: ") + len(t.Prompt) + len("\nAssistant: ") + len(t.Response) + len("\n\n")
+}
+
+// StripANSI removes ANSI terminal escape sequences (CSI, OSC, and shorter ESC
+// sequences) from s.
 func StripANSI(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
@@ -109,8 +142,12 @@ func StripANSI(s string) string {
 				i++
 			}
 		default:
-			// Two-byte ESC sequence.
+			// Other escapes: optional intermediate bytes (0x20-0x2F) and a
+			// final byte, e.g. "ESC c" or the charset selection "ESC ( B".
 			i++
+			for i < len(s)-1 && s[i] >= 0x20 && s[i] <= 0x2f {
+				i++
+			}
 		}
 	}
 

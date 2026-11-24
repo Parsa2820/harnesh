@@ -1,8 +1,8 @@
 package shell
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,10 +16,14 @@ import (
 const (
 	promptProbeTimeout  = 2 * time.Second
 	promptRenderTimeout = 2 * time.Second
-	promptStartMarker   = "__HARNESH_P_START__"
-	promptEndMarker     = "__HARNESH_P_END__"
-	ps1StartMarker      = "__HARNESH_PS1_START__"
-	ps1EndMarker        = "__HARNESH_PS1_END__"
+	// promptPipeGrace bounds how long to wait for a helper shell's output
+	// pipe after the shell itself is done. Without it, a daemon started from
+	// an rc file that inherits stdout would stall the prompt indefinitely.
+	promptPipeGrace   = 250 * time.Millisecond
+	promptStartMarker = "__HARNESH_P_START__"
+	promptEndMarker   = "__HARNESH_P_END__"
+	ps1StartMarker    = "__HARNESH_PS1_START__"
+	ps1EndMarker      = "__HARNESH_PS1_END__"
 )
 
 // colorEnvKeys lists shell color configuration variables inherited from the
@@ -173,7 +177,7 @@ func (r *PromptRenderer) Render(ctx context.Context, lastExitCode int) string {
 		}
 	default:
 		if r.rawPS1 != "" {
-			return ExpandBashPS1(r.rawPS1, lastExitCode)
+			return ExpandBashPS1(r.rawPS1)
 		}
 	}
 	return DefaultPrompt()
@@ -195,17 +199,14 @@ func (r *PromptRenderer) renderZsh(ctx context.Context, lastExitCode int) string
 	rctx, cancel := context.WithTimeout(ctx, promptRenderTimeout)
 	defer cancel()
 
-	var cmd *exec.Cmd
 	if !r.needsInteractive {
 		// Fast path (~5ms): skip rc files when PS1 has no command/var substitutions.
-		script := fmt.Sprintf(`(exit "$1"); print -rPn -- "$2"`)
-		cmd = exec.CommandContext(rctx, r.shellPath, "-f", "-c", script, "_", strconv.Itoa(lastExitCode), r.rawPS1)
-		cmd.Stdin = nil
-		out, err := cmd.Output()
-		if err == nil && len(out) > 0 {
-			return string(out)
+		const script = `(exit "$1"); print -rPn -- "$2"`
+		out, err := shellOutput(rctx, r.shellPath, "-f", "-c", script, "_", strconv.Itoa(lastExitCode), r.rawPS1)
+		if err != nil {
+			return ""
 		}
-		return ""
+		return out
 	}
 
 	// Interactive path: load rc files so functions like $(git_branch_name) and
@@ -220,13 +221,11 @@ func (r *PromptRenderer) renderZsh(ctx context.Context, lastExitCode int) string
 		args = []string{"-i", "-c", script, "_", strconv.Itoa(lastExitCode)}
 	}
 
-	cmd = exec.CommandContext(rctx, r.shellPath, args...)
-	cmd.Stdin = nil
-	out, err := cmd.Output()
+	out, err := shellOutput(rctx, r.shellPath, args...)
 	if err != nil {
 		return ""
 	}
-	if extracted, ok := extractBetween(string(out), promptStartMarker, promptEndMarker); ok && extracted != "" {
+	if extracted, ok := extractBetween(out, promptStartMarker, promptEndMarker); ok && extracted != "" {
 		return extracted
 	}
 	return ""
@@ -252,15 +251,13 @@ func (r *PromptRenderer) renderBash(ctx context.Context, lastExitCode int) strin
 			script = fmt.Sprintf(`printf %q; (exit "$1"); printf '%%s' "${PS1@P}"; printf %q`, promptStartMarker, promptEndMarker)
 			args = []string{"-i", "-c", script, "_", strconv.Itoa(lastExitCode)}
 		}
-		cmd := exec.CommandContext(rctx, r.shellPath, args...)
-		cmd.Stdin = nil
-		if out, err := cmd.Output(); err == nil {
-			if extracted, ok := extractBetween(string(out), promptStartMarker, promptEndMarker); ok && extracted != "" {
+		if out, err := shellOutput(rctx, r.shellPath, args...); err == nil {
+			if extracted, ok := extractBetween(out, promptStartMarker, promptEndMarker); ok && extracted != "" {
 				return stripReadlineBrackets(extracted)
 			}
 		}
 	}
-	return ExpandBashPS1(r.rawPS1, lastExitCode)
+	return ExpandBashPS1(r.rawPS1)
 }
 
 // renderFish invokes fish's fish_prompt function to capture its colored prompt.
@@ -269,16 +266,28 @@ func (r *PromptRenderer) renderFish(ctx context.Context, lastExitCode int) strin
 	defer cancel()
 
 	script := fmt.Sprintf(`printf %q; sh -c "exit %d"; fish_prompt; printf %q`, promptStartMarker, lastExitCode, promptEndMarker)
-	cmd := exec.CommandContext(rctx, r.shellPath, "-c", script)
-	cmd.Stdin = nil
-	out, err := cmd.Output()
+	out, err := shellOutput(rctx, r.shellPath, "-c", script)
 	if err != nil {
 		return ""
 	}
-	if extracted, ok := extractBetween(string(out), promptStartMarker, promptEndMarker); ok && extracted != "" {
+	if extracted, ok := extractBetween(out, promptStartMarker, promptEndMarker); ok && extracted != "" {
 		return extracted
 	}
 	return ""
+}
+
+// shellOutput runs a helper shell with stdin detached and returns what it
+// wrote to stdout. Output is returned even alongside an error, since rc files
+// can make a shell exit non-zero after it has printed what was asked for.
+func shellOutput(ctx context.Context, shellPath string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, shellPath, args...)
+	cmd.WaitDelay = promptPipeGrace
+	out, err := cmd.Output()
+	if errors.Is(err, exec.ErrWaitDelay) {
+		// The shell succeeded; only a background process kept the pipe open.
+		err = nil
+	}
+	return string(out), err
 }
 
 // probeOriginalShell launches the original shell once in interactive mode (with
@@ -309,14 +318,9 @@ func probeOriginalShell(shellPath, shellKind string, needPS1 bool) (string, []st
 		return "", nil
 	}
 
-	cmd := exec.CommandContext(ctx, shellPath, "-i", "-c", script.String())
-	cmd.Stdin = nil
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = nil
-	_ = cmd.Run()
-
-	output := stdout.String()
+	// The exit status is irrelevant here: whatever was printed between the
+	// markers is used.
+	output, _ := shellOutput(ctx, shellPath, "-i", "-c", script.String())
 	var ps1 string
 	if needPS1 {
 		if v, ok := extractBetween(output, ps1StartMarker, ps1EndMarker); ok {
@@ -372,8 +376,9 @@ func extractBetween(s, start, end string) (string, bool) {
 
 // ExpandBashPS1 expands standard Bash/POSIX PS1 prompt escape sequences
 // (including ANSI color escapes such as \e, \033, and \x1b) while stripping
-// readline non-printing markers (\[ and \]).
-func ExpandBashPS1(ps1 string, lastExitCode int) string {
+// readline non-printing markers (\[ and \]). It performs no parameter or
+// command substitution, so it cannot reflect the last exit status.
+func ExpandBashPS1(ps1 string) string {
 	var b strings.Builder
 	b.Grow(len(ps1) + 16)
 
@@ -473,7 +478,6 @@ func ExpandBashPS1(ps1 string, lastExitCode int) string {
 		}
 	}
 
-	_ = lastExitCode
 	return stripReadlineBrackets(b.String())
 }
 

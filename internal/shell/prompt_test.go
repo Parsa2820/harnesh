@@ -2,14 +2,17 @@ package shell
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestExpandBashPS1(t *testing.T) {
 	ps1 := `\[\033[36m\]\u@\h \[\e[34m\]\w\[\x1b[0m\] \$ `
-	got := ExpandBashPS1(ps1, 0)
+	got := ExpandBashPS1(ps1)
 
 	if strings.Contains(got, `\[`) || strings.Contains(got, `\]`) {
 		t.Fatalf("readline brackets not stripped: %q", got)
@@ -72,5 +75,27 @@ func TestStripReadlineBracketsAndNeedsInteractive(t *testing.T) {
 	}
 	if !ps1NeedsInteractiveShell(`%F{magenta}$(git_branch_name)%f %# `) {
 		t.Fatal("$(...) command substitution should require an interactive subshell")
+	}
+}
+
+func TestRenderDoesNotWaitForBackgroundProcesses(t *testing.T) {
+	// A stand-in "zsh" that, like an rc file starting a daemon, leaves a
+	// background process holding its stdout open after printing the prompt.
+	fakeZsh := filepath.Join(t.TempDir(), "zsh")
+	script := "#!/bin/sh\nsleep 5 &\nprintf 'PROMPT> '\n"
+	if err := os.WriteFile(fakeZsh, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	r := NewPromptRenderer(fakeZsh, "ignored> ", false)
+	start := time.Now()
+	got := r.Render(context.Background(), 0)
+	elapsed := time.Since(start)
+
+	if got != "PROMPT> " {
+		t.Fatalf("Render = %q, want %q", got, "PROMPT> ")
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("Render took %v; it must not wait for the background process to exit", elapsed)
 	}
 }

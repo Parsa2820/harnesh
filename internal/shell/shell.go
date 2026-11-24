@@ -1,17 +1,13 @@
 package shell
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
-	"path/filepath"
-	"strconv"
 	"strings"
+	"time"
 )
 
 // DefaultSystemShell is the fallback POSIX shell used to execute !commands when
@@ -21,6 +17,16 @@ const DefaultSystemShell = "/bin/sh"
 // clearScreenSeq clears the terminal scrollback buffer, moves the cursor to
 // row 1 column 1, and clears the visible screen — matching standard clear(1).
 const clearScreenSeq = "\x1b[3J\x1b[H\x1b[2J"
+
+// DefaultMaxPromptBytes is the default cap on the size of a prompt (including
+// replayed conversation history) passed to the agent harness. The prompt
+// travels as a single argv element, which Linux limits to 128 KiB
+// (MAX_ARG_STRLEN) regardless of the overall ARG_MAX.
+const DefaultMaxPromptBytes = 96 << 10
+
+// childShutdownGrace is how long a child process gets to exit after being
+// sent SIGTERM during shutdown before it is killed.
+const childShutdownGrace = 3 * time.Second
 
 // Config configures a Shell instance.
 type Config struct {
@@ -58,6 +64,11 @@ type Config struct {
 	// interactive command history (e.g., ~/.harnesh_history). When empty,
 	// command history is retained in memory for the current session only.
 	HistoryFile string
+
+	// MaxPromptBytes caps the size of the prompt passed to the harness. When
+	// the retained conversation no longer fits, the oldest turns are left out.
+	// Defaults to DefaultMaxPromptBytes.
+	MaxPromptBytes int
 }
 
 // EvalResult describes the outcome of evaluating a single input line.
@@ -76,10 +87,15 @@ type EvalResult struct {
 type Shell struct {
 	cfg          Config
 	prompt       *PromptRenderer
-	editor       *LineEditor
+	editor       *LineEditor  // interactive mode only
+	input        *inputReader // non-interactive mode only
 	conversation Conversation
 	lastExitCode int
 	prevDir      string
+
+	// trimNoticeShown records that the user has been told the conversation
+	// outgrew MaxPromptBytes, so the notice is printed once per conversation.
+	trimNoticeShown bool
 }
 
 // New creates a new Shell from cfg, applying sensible defaults for any omitted
@@ -100,6 +116,9 @@ func New(cfg Config) (*Shell, error) {
 	if cfg.SystemShell == "" {
 		cfg.SystemShell = DetectOriginalShell()
 	}
+	if cfg.MaxPromptBytes <= 0 {
+		cfg.MaxPromptBytes = DefaultMaxPromptBytes
+	}
 
 	sh := &Shell{
 		cfg:     cfg,
@@ -108,6 +127,8 @@ func New(cfg Config) (*Shell, error) {
 	}
 	if cfg.Interactive {
 		sh.editor = NewLineEditor(cfg.In, cfg.Out, cfg.HistoryFile)
+	} else {
+		sh.input = newInputReader(cfg.In)
 	}
 	return sh, nil
 }
@@ -121,62 +142,64 @@ func (s *Shell) Run(ctx context.Context) int {
 	return s.runNonInteractive(ctx)
 }
 
-// runInteractive drives the TTY REPL using LineEditor for arrow-key history
-// navigation and inline cursor editing.
+// runInteractive drives the TTY REPL using LineEditor for history navigation
+// and inline editing.
 func (s *Shell) runInteractive(ctx context.Context) int {
 	fmt.Fprintf(s.cfg.Out, "harnesh — agent harness: %s\n", s.cfg.Harness.String())
 	fmt.Fprintln(s.cfg.Out, "Enter a prompt for the agent, !<command> for the shell, !clear to reset, or !exit / Ctrl-D to quit.")
 
-	var cachedPrompt string
+	// The rendered prompt is reused until something runs that could change
+	// it (working directory, git state, exit status).
+	var prompt string
 	promptDirty := true
 
 	for {
 		if ctx.Err() != nil {
 			return s.lastExitCode
 		}
-
 		if promptDirty {
-			cachedPrompt = s.Prompt(ctx)
+			prompt = s.Prompt(ctx)
 			promptDirty = false
 		}
 
-		line, err := s.editor.ReadLine(cachedPrompt)
-		if errors.Is(err, ErrInterrupted) {
+		line, err := s.editor.ReadLine(ctx, prompt)
+		switch {
+		case errors.Is(err, ErrInterrupted):
 			s.lastExitCode = 130
 			promptDirty = true
 			continue
-		}
-		if errors.Is(err, io.EOF) {
+		case errors.Is(err, io.EOF), ctx.Err() != nil:
 			return s.lastExitCode
-		}
-		if err != nil {
+		case err != nil:
 			fmt.Fprintf(s.cfg.Err, "harnesh: read error: %v\n", err)
 			return 1
 		}
 
-		if strings.TrimSpace(line) != "" {
-			s.editor.AddHistory(line)
-			res := s.EvalLine(ctx, line)
-			if res.ShouldExit {
-				return res.ExitCode
-			}
-			promptDirty = true
+		if strings.TrimSpace(line) == "" {
+			continue
 		}
+		s.editor.AddHistory(line)
+		res := s.EvalLine(ctx, line)
+		if res.ShouldExit {
+			return res.ExitCode
+		}
+		// Output that lacks a trailing newline must not be overwritten by
+		// the next prompt.
+		s.editor.FreshLine()
+		promptDirty = true
 	}
 }
 
-// runNonInteractive drives the REPL for piped or scripted input without raw
-// terminal mode or prompt output.
+// runNonInteractive drives the REPL for piped or scripted input, one line per
+// prompt or command, without raw terminal mode or prompt output.
 func (s *Shell) runNonInteractive(ctx context.Context) int {
-	reader := bufio.NewReader(s.cfg.In)
-
 	for {
-		if ctx.Err() != nil {
+		line, err := s.input.readLine(ctx)
+		atEOF := errors.Is(err, io.EOF)
+		switch {
+		case ctx.Err() != nil:
 			return s.lastExitCode
-		}
-
-		line, err := reader.ReadString('\n')
-		if err != nil && !errors.Is(err, io.EOF) {
+		case err != nil && !atEOF:
 			fmt.Fprintf(s.cfg.Err, "harnesh: read error: %v\n", err)
 			return 1
 		}
@@ -187,8 +210,7 @@ func (s *Shell) runNonInteractive(ctx context.Context) int {
 				return res.ExitCode
 			}
 		}
-
-		if errors.Is(err, io.EOF) {
+		if atEOF {
 			return s.lastExitCode
 		}
 	}
@@ -234,239 +256,4 @@ func (s *Shell) LastExitCode() int {
 // Conversation returns a pointer to the shell's retained agent conversation.
 func (s *Shell) Conversation() *Conversation {
 	return &s.conversation
-}
-
-// runShellLine handles a "!<command>" line, intercepting the built-in !cd,
-// !clear, and !exit commands when they are invoked as standalone commands, and
-// delegating everything else to the system shell.
-func (s *Shell) runShellLine(ctx context.Context, cmdLine string) EvalResult {
-	if !hasUnquotedShellOperators(cmdLine) {
-		tokens, err := SplitArgs(cmdLine)
-		if err == nil && len(tokens) > 0 {
-			switch tokens[0] {
-			case "exit":
-				return s.builtinExit(tokens[1:])
-			case "cd":
-				s.builtinCD(tokens[1:])
-				return EvalResult{ExitCode: s.lastExitCode}
-			case "clear":
-				s.builtinClear(ctx, cmdLine, tokens[1:])
-				return EvalResult{ExitCode: s.lastExitCode}
-			}
-		}
-	}
-
-	s.runExternalShellCommand(ctx, cmdLine)
-	return EvalResult{ExitCode: s.lastExitCode}
-}
-
-// builtinClear implements "!clear", clearing both the terminal screen and the
-// retained agent conversation history.
-func (s *Shell) builtinClear(ctx context.Context, cmdLine string, args []string) {
-	s.conversation.Clear()
-	if len(args) > 0 {
-		s.runExternalShellCommand(ctx, cmdLine)
-		return
-	}
-	fmt.Fprint(s.cfg.Out, clearScreenSeq)
-	s.lastExitCode = 0
-}
-
-// builtinExit implements "!exit [code]". With no arguments, it exits using the
-// last command's exit code.
-func (s *Shell) builtinExit(args []string) EvalResult {
-	if len(args) == 0 {
-		return EvalResult{ShouldExit: true, ExitCode: s.lastExitCode}
-	}
-	if len(args) > 1 {
-		fmt.Fprintln(s.cfg.Err, "harnesh: exit: too many arguments")
-		s.lastExitCode = 1
-		return EvalResult{ExitCode: 1}
-	}
-	code, err := strconv.Atoi(args[0])
-	if err != nil {
-		fmt.Fprintf(s.cfg.Err, "harnesh: exit: numeric argument required: %s\n", args[0])
-		s.lastExitCode = 2
-		return EvalResult{ExitCode: 2}
-	}
-	return EvalResult{ShouldExit: true, ExitCode: code}
-}
-
-// builtinCD implements "!cd [dir]" in-process so that directory changes persist
-// across subsequent shell commands and agent invocations. Supports bare "!cd"
-// (home directory), "!cd -" (previous directory), and "~" prefix expansion.
-func (s *Shell) builtinCD(args []string) {
-	if len(args) > 1 {
-		fmt.Fprintln(s.cfg.Err, "harnesh: cd: too many arguments")
-		s.lastExitCode = 1
-		return
-	}
-
-	var target string
-	printTarget := false
-
-	if len(args) == 0 {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			fmt.Fprintf(s.cfg.Err, "harnesh: cd: cannot determine home directory: %v\n", err)
-			s.lastExitCode = 1
-			return
-		}
-		target = home
-	} else {
-		arg := args[0]
-		switch {
-		case arg == "-":
-			if s.prevDir == "" {
-				fmt.Fprintln(s.cfg.Err, "harnesh: cd: OLDPWD not set")
-				s.lastExitCode = 1
-				return
-			}
-			target = s.prevDir
-			printTarget = true
-		case arg == "~" || strings.HasPrefix(arg, "~/"):
-			home, err := os.UserHomeDir()
-			if err != nil {
-				fmt.Fprintf(s.cfg.Err, "harnesh: cd: cannot determine home directory: %v\n", err)
-				s.lastExitCode = 1
-				return
-			}
-			target = filepath.Join(home, arg[1:])
-		default:
-			target = arg
-		}
-	}
-
-	oldDir, _ := os.Getwd()
-	if err := os.Chdir(target); err != nil {
-		fmt.Fprintf(s.cfg.Err, "harnesh: cd: %v\n", err)
-		s.lastExitCode = 1
-		return
-	}
-
-	newDir, err := os.Getwd()
-	if err == nil {
-		_ = os.Setenv("PWD", newDir)
-	}
-	if oldDir != "" {
-		s.prevDir = oldDir
-		_ = os.Setenv("OLDPWD", oldDir)
-	}
-	if printTarget && newDir != "" {
-		fmt.Fprintln(s.cfg.Out, newDir)
-	}
-	s.lastExitCode = 0
-}
-
-// runExternalShellCommand executes cmdLine using the configured system shell,
-// inheriting any color variables discovered from the original shell.
-func (s *Shell) runExternalShellCommand(ctx context.Context, cmdLine string) {
-	cmd := exec.CommandContext(ctx, s.cfg.SystemShell, "-c", cmdLine)
-	cmd.Stdout = s.cfg.Out
-	cmd.Stderr = s.cfg.Err
-	if s.cfg.Interactive {
-		if f, ok := s.cfg.In.(*os.File); ok {
-			cmd.Stdin = f
-		}
-	}
-	if extra := s.prompt.ColorEnv(); len(extra) > 0 {
-		cmd.Env = append(os.Environ(), extra...)
-	}
-
-	if err := cmd.Run(); err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			s.lastExitCode = normalizeExitCode(exitErr.ExitCode())
-			return
-		}
-		fmt.Fprintf(s.cfg.Err, "harnesh: failed to run shell command: %v\n", err)
-		s.lastExitCode = 127
-		return
-	}
-	s.lastExitCode = 0
-}
-
-// runAgentPrompt invokes the configured CLI agent harness with prompt (wrapped
-// with any retained conversation history), streams its output live to Out, and
-// appends successful turns to the retained conversation.
-//
-// Stdin is explicitly left nil (/dev/null) so non-interactive agent CLIs never
-// block waiting for EOF or consume buffered lines from piped input.
-func (s *Shell) runAgentPrompt(ctx context.Context, prompt string) {
-	fullPrompt := s.conversation.FormatPrompt(prompt)
-	args := s.cfg.Harness.BuildArgs(fullPrompt)
-
-	var respBuf bytes.Buffer
-	cmd := exec.CommandContext(ctx, s.cfg.Harness.Binary, args...)
-	cmd.Stdin = nil
-	cmd.Stdout = io.MultiWriter(s.cfg.Out, &respBuf)
-	cmd.Stderr = s.cfg.Err
-
-	if err := cmd.Run(); err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			code := normalizeExitCode(exitErr.ExitCode())
-			s.lastExitCode = code
-			if exitErr.ExitCode() > 0 {
-				fmt.Fprintf(s.cfg.Err, "harnesh: agent exited with status %d\n", code)
-			}
-			return
-		}
-		fmt.Fprintf(s.cfg.Err, "harnesh: failed to run agent %q: %v\n", s.cfg.Harness.Binary, err)
-		s.lastExitCode = 127
-		return
-	}
-
-	s.conversation.Add(prompt, respBuf.String())
-	s.lastExitCode = 0
-}
-
-// normalizeExitCode converts Go's -1 (terminated by signal) into 130 (standard
-// shell signal-interrupted exit status), while preserving positive exit codes.
-func normalizeExitCode(code int) int {
-	if code < 0 {
-		return 130
-	}
-	return code
-}
-
-// hasUnquotedShellOperators reports whether s contains shell control or
-// redirection operators outside of single/double quotes and backslash escapes.
-// When true, commands like "!cd /tmp && ls" are delegated to the system shell
-// rather than intercepted by an in-process built-in.
-func hasUnquotedShellOperators(s string) bool {
-	var inSQuot, inDQuot bool
-	for i := 0; i < len(s); i++ {
-		ch := s[i]
-		switch {
-		case inSQuot:
-			if ch == '\'' {
-				inSQuot = false
-			}
-		case inDQuot:
-			if ch == '\\' && i+1 < len(s) {
-				i++
-			} else if ch == '"' {
-				inDQuot = false
-			}
-		default:
-			switch ch {
-			case '\'':
-				inSQuot = true
-			case '"':
-				inDQuot = true
-			case '\\':
-				if i+1 < len(s) {
-					i++
-				}
-			case '|', '&', ';', '>', '<', '`':
-				return true
-			case '$':
-				if i+1 < len(s) && s[i+1] == '(' {
-					return true
-				}
-			}
-		}
-	}
-	return false
 }

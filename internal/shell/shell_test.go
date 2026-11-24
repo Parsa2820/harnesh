@@ -3,11 +3,48 @@ package shell
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
+
+// syncBuffer is a bytes.Buffer that can be read while a child process is
+// still writing to it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// preserveWorkingDir restores the process working directory and the PWD and
+// OLDPWD variables when the test finishes, since !cd changes all three.
+func preserveWorkingDir(t *testing.T) {
+	t.Helper()
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	t.Setenv("PWD", origDir)
+	t.Setenv("OLDPWD", os.Getenv("OLDPWD"))
+	t.Cleanup(func() {
+		_ = os.Chdir(origDir)
+	})
+}
 
 func newTestShell(t *testing.T, harnessCmd string, input string) (*Shell, *bytes.Buffer, *bytes.Buffer) {
 	t.Helper()
@@ -140,26 +177,10 @@ func TestShellPlaceholderHarness(t *testing.T) {
 }
 
 func TestShellBuiltinCD(t *testing.T) {
-	origDir, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("Getwd: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = os.Chdir(origDir)
-	})
+	preserveWorkingDir(t)
 
 	dirA := t.TempDir()
 	dirB := t.TempDir()
-
-	// Resolve symlinks (macOS /var -> /private/var) so comparisons match pwd.
-	realA, err := filepath.EvalSymlinks(dirA)
-	if err != nil {
-		t.Fatalf("EvalSymlinks(dirA): %v", err)
-	}
-	realB, err := filepath.EvalSymlinks(dirB)
-	if err != nil {
-		t.Fatalf("EvalSymlinks(dirB): %v", err)
-	}
 
 	input := strings.Join([]string{
 		"!cd " + dirA,
@@ -177,7 +198,7 @@ func TestShellBuiltinCD(t *testing.T) {
 	}
 
 	lines := strings.Split(strings.TrimSpace(outBuf.String()), "\n")
-	want := []string{realA, realB, realA, realA}
+	want := []string{dirA, dirB, dirA, dirA}
 	if len(lines) != len(want) {
 		t.Fatalf("got lines %#v, want %#v", lines, want)
 	}
@@ -185,6 +206,103 @@ func TestShellBuiltinCD(t *testing.T) {
 		if lines[i] != want[i] {
 			t.Fatalf("line %d = %q, want %q", i, lines[i], want[i])
 		}
+	}
+}
+
+func TestShellBuiltinCDTracksLogicalPath(t *testing.T) {
+	preserveWorkingDir(t)
+
+	// base/link -> base/real; entering the link must keep showing "link",
+	// and "cd .." must return to base rather than real's physical parent.
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	realDir := filepath.Join(base, "real", "nested")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(realDir, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	input := "!cd " + link + "\n!pwd\n!cd ..\n!pwd\n"
+	sh, outBuf, errBuf := newTestShell(t, "echo", input)
+	if code := sh.Run(context.Background()); code != 0 {
+		t.Fatalf("Run exited with %d, stderr=%q", code, errBuf.String())
+	}
+	if got, want := outBuf.String(), link+"\n"+base+"\n"; got != want {
+		t.Fatalf("pwd output = %q, want %q", got, want)
+	}
+	if got := os.Getenv("PWD"); got != base {
+		t.Fatalf("PWD = %q, want %q", got, base)
+	}
+}
+
+func TestShellBuiltinCDUsesShellExpansion(t *testing.T) {
+	preserveWorkingDir(t)
+
+	base := t.TempDir()
+	target := filepath.Join(base, "project-alpha")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	t.Setenv("HARNESH_TEST_BASE", base)
+
+	tests := []struct {
+		name string
+		arg  string
+	}{
+		{"environment variable", "$HARNESH_TEST_BASE/project-alpha"},
+		{"quoted variable", `"${HARNESH_TEST_BASE}/project-alpha"`},
+		{"command substitution", "$(echo $HARNESH_TEST_BASE | cat)/project-alpha"},
+		{"glob", base + "/project-al*"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			input := "!cd " + base + "\n!cd " + tc.arg + "\n!pwd\n"
+			sh, outBuf, errBuf := newTestShell(t, "echo", input)
+			if code := sh.Run(context.Background()); code != 0 {
+				t.Fatalf("Run exited with %d, stderr=%q", code, errBuf.String())
+			}
+			if got, want := outBuf.String(), target+"\n"; got != want {
+				t.Fatalf("pwd output = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestShellBuiltinCDErrors(t *testing.T) {
+	preserveWorkingDir(t)
+	start := t.TempDir()
+
+	tests := []struct {
+		name    string
+		line    string
+		wantErr string
+	}{
+		{"missing directory", "!cd /definitely/not/a/real/dir", "harnesh: cd: /definitely/not/a/real/dir: no such file or directory"},
+		{"too many arguments", "!cd a b", "harnesh: cd: too many arguments"},
+		{"missing directory via expansion", "!cd $HOME/definitely-not-a-real-dir-xyz", "definitely-not-a-real-dir-xyz"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			input := "!cd " + start + "\n" + tc.line + "\n"
+			sh, outBuf, errBuf := newTestShell(t, "echo", input)
+			if code := sh.Run(context.Background()); code == 0 {
+				t.Fatalf("exit code = 0, want failure")
+			}
+			if !strings.Contains(errBuf.String(), tc.wantErr) {
+				t.Fatalf("stderr = %q, want it to contain %q", errBuf.String(), tc.wantErr)
+			}
+			if outBuf.Len() != 0 {
+				t.Fatalf("unexpected stdout %q", outBuf.String())
+			}
+			if got := os.Getenv("PWD"); got != start {
+				t.Fatalf("failed cd changed PWD to %q, want %q", got, start)
+			}
+		})
 	}
 }
 
@@ -207,6 +325,13 @@ func TestShellBuiltinExit(t *testing.T) {
 		code := sh.Run(context.Background())
 		if code != 1 {
 			t.Fatalf("exit code = %d, want 1", code)
+		}
+	})
+
+	t.Run("exit code wraps to a single byte like other shells", func(t *testing.T) {
+		sh, _, _ := newTestShell(t, "echo", "!exit 300\n")
+		if code := sh.Run(context.Background()); code != 44 {
+			t.Fatalf("exit code = %d, want 44", code)
 		}
 	})
 
@@ -311,24 +436,212 @@ func TestShellInteractiveArrowHistoryRecall(t *testing.T) {
 	}
 }
 
-func TestHasUnquotedShellOperators(t *testing.T) {
+func TestShellReportsSignalExitStatus(t *testing.T) {
+	// A command killed by a signal reports 128+N, as shells do.
+	sh, _, errBuf := newTestShell(t, "echo", "!kill -TERM $$\n")
+	if code := sh.Run(context.Background()); code != 128+15 {
+		t.Fatalf("exit code = %d, want 143 (stderr=%q)", code, errBuf.String())
+	}
+}
+
+func TestShellTrimsConversationThatOutgrowsPromptLimit(t *testing.T) {
+	hc, err := ParseHarnessCommand(`printf "%s\n"`)
+	if err != nil {
+		t.Fatalf("ParseHarnessCommand: %v", err)
+	}
+	// Every echoed turn is larger than the previous, so the limit is hit fast.
+	input := strings.Join([]string{
+		"alpha " + strings.Repeat("x", 100),
+		"beta",
+		"gamma",
+		"delta",
+		"!clear",
+		"epsilon",
+	}, "\n") + "\n"
+
+	var outBuf, errBuf bytes.Buffer
+	sh, err := New(Config{
+		Harness:        hc,
+		In:             strings.NewReader(input),
+		Out:            &outBuf,
+		Err:            &errBuf,
+		SystemShell:    "/bin/sh",
+		MaxPromptBytes: 400,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if code := sh.Run(context.Background()); code != 0 {
+		t.Fatalf("Run exited with %d, stderr=%q", code, errBuf.String())
+	}
+
+	if got := strings.Count(errBuf.String(), "no longer fits in one prompt"); got != 1 {
+		t.Fatalf("trim notice printed %d times, want exactly once; stderr=%q", got, errBuf.String())
+	}
+	// The harness echoes each prompt it receives, one per line group; none
+	// may exceed the limit by more than the newest message itself.
+	afterClear := outBuf.String()[strings.LastIndex(outBuf.String(), clearScreenSeq)+len(clearScreenSeq):]
+	if afterClear != "epsilon\n" {
+		t.Fatalf("prompt after !clear = %q, want only the new message", afterClear)
+	}
+	if !strings.Contains(outBuf.String(), "earlier turns omitted") {
+		t.Fatalf("expected a trimmed transcript to be sent, got:\n%s", outBuf.String())
+	}
+}
+
+func TestShellReportsOversizedPrompt(t *testing.T) {
+	// A single prompt beyond the OS argument limit cannot be delivered; the
+	// failure must be explained rather than surfacing a raw exec error.
+	huge := strings.Repeat("x", 4<<20)
+	sh, _, errBuf := newTestShell(t, "echo", huge+"\n")
+	if code := sh.Run(context.Background()); code == 0 {
+		t.Fatal("exit code = 0, want failure")
+	}
+	if !strings.Contains(errBuf.String(), "too large to pass") {
+		t.Fatalf("stderr = %.200q, want an explanation that the prompt is too large", errBuf.String())
+	}
+	if sh.Conversation().Len() != 0 {
+		t.Fatal("undelivered prompt must not be retained")
+	}
+}
+
+func TestShellRunStopsWhenContextIsCancelled(t *testing.T) {
+	t.Run("while waiting for input", func(t *testing.T) {
+		pr, pw := io.Pipe()
+		defer pw.Close()
+
+		hc, _ := ParseHarnessCommand("echo")
+		sh, err := New(Config{Harness: hc, In: pr, Out: io.Discard, Err: io.Discard, SystemShell: "/bin/sh"})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan int, 1)
+		go func() { done <- sh.Run(ctx) }()
+
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Run did not return after cancellation while blocked on input")
+		}
+	})
+
+	t.Run("while a child is running", func(t *testing.T) {
+		// "exec" makes sleep the direct child regardless of which /bin/sh
+		// is installed, so it is the process that receives SIGTERM.
+		hc, _ := ParseHarnessCommand("echo")
+		var out syncBuffer
+		sh, err := New(Config{
+			Harness:     hc,
+			In:          strings.NewReader("!echo started; exec sleep 60\n!echo should-not-run\n"),
+			Out:         &out,
+			Err:         io.Discard,
+			SystemShell: "/bin/sh",
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan int, 1)
+		go func() { done <- sh.Run(ctx) }()
+
+		for deadline := time.Now().Add(10 * time.Second); out.String() != "started\n"; {
+			if time.Now().After(deadline) {
+				t.Fatalf("child did not start; output %q", out.String())
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+
+		start := time.Now()
+		cancel()
+		select {
+		case code := <-done:
+			// The child is terminated with SIGTERM, well inside the grace period.
+			if elapsed := time.Since(start); elapsed >= childShutdownGrace {
+				t.Fatalf("shutdown took %v; child should exit on SIGTERM", elapsed)
+			}
+			if code != 128+15 {
+				t.Fatalf("exit code = %d, want 143 (child terminated by SIGTERM)", code)
+			}
+			if got := out.String(); got != "started\n" {
+				t.Fatalf("commands ran after cancellation: %q", got)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("Run did not return after cancellation while a child was running")
+		}
+	})
+}
+
+func TestShellInteractivePasteIsASinglePrompt(t *testing.T) {
+	hc, err := ParseHarnessCommand(`printf "AI:[%s]\n"`)
+	if err != nil {
+		t.Fatalf("ParseHarnessCommand: %v", err)
+	}
+	input := "\x1b[200~line one\nline two\n\x1b[201~\r" + "\x04"
+
+	var outBuf, errBuf bytes.Buffer
+	sh, err := New(Config{
+		Harness:     hc,
+		In:          strings.NewReader(input),
+		Out:         &outBuf,
+		Err:         &errBuf,
+		Interactive: true,
+		SystemShell: "/bin/sh",
+		PS1:         "$ ",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if code := sh.Run(context.Background()); code != 0 {
+		t.Fatalf("Run exited with %d, stderr=%q", code, errBuf.String())
+	}
+	if !strings.Contains(outBuf.String(), "AI:[line one\nline two]\n") {
+		t.Fatalf("pasted lines were not sent as one prompt:\n%q", outBuf.String())
+	}
+	if got := sh.Conversation().Len(); got != 1 {
+		t.Fatalf("Conversation().Len() = %d, want 1", got)
+	}
+}
+
+func TestAnalyzeCommandLine(t *testing.T) {
 	tests := []struct {
-		input string
-		want  bool
+		input        string
+		wantCompound bool
+		wantExpands  bool
 	}{
-		{"cd /tmp", false},
-		{`cd "dir with & and |"`, false},
-		{`cd 'dir;with;semicolons'`, false},
-		{`cd dir\&escaped`, false},
-		{"cd /tmp && ls", true},
-		{"cd /tmp; pwd", true},
-		{"cd /tmp | cat", true},
-		{"cd $(pwd)", true},
+		{"cd /tmp", false, false},
+		{"cd ~", false, false},
+		{"cd ~/src", false, false},
+		{`cd "dir with & and |"`, false, false},
+		{`cd 'dir;with;semicolons'`, false, false},
+		{`cd 'literal $HOME and *'`, false, false},
+		{`cd dir\&escaped`, false, false},
+		{`cd dir\$escaped`, false, false},
+		{"cd /tmp && ls", true, false},
+		{"cd /tmp; pwd", true, false},
+		{"cd /tmp | cat", true, false},
+		{"cd /tmp > out", true, false},
+		{"(cd /tmp)", true, false},
+		{"cd /tmp\nls", true, false},
+		{"cd $HOME", false, true},
+		{`cd "$HOME/src"`, false, true},
+		{"cd ${PROJECTS}/x", false, true},
+		{"cd ~alice", false, true},
+		{"cd proj*", false, true},
+		{"cd dir?", false, true},
+		{"cd {a,b}", false, true},
+		// Operators inside a command substitution do not make the line compound.
+		{"cd $(git rev-parse --show-toplevel | cat)", false, true},
+		{"cd `dirname x; echo`", false, true},
+		{`cd "$(pwd)" && ls`, true, true},
 	}
 
 	for _, tc := range tests {
-		if got := hasUnquotedShellOperators(tc.input); got != tc.want {
-			t.Errorf("hasUnquotedShellOperators(%q) = %v, want %v", tc.input, got, tc.want)
+		compound, expands := analyzeCommandLine(tc.input)
+		if compound != tc.wantCompound || expands != tc.wantExpands {
+			t.Errorf("analyzeCommandLine(%q) = (compound %v, expands %v), want (%v, %v)",
+				tc.input, compound, expands, tc.wantCompound, tc.wantExpands)
 		}
 	}
 }
