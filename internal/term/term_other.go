@@ -11,3 +11,9 @@ func MakeRaw(int) (func(), error) { return nil, ErrUnsupported }
 
 // Width is unknown on this platform.
 func Width(int) (int, bool) { return 0, false }
+
+// ForegroundProcessGroup is unsupported on this platform.
+func ForegroundProcessGroup(int) (int, error) { return 0, ErrUnsupported }
+
+// SetForegroundProcessGroup is unsupported on this platform.
+func SetForegroundProcessGroup(int, int) error { return ErrUnsupported }

@@ -3,9 +3,22 @@ package main
 import (
 	"bytes"
 	"context"
+	"os"
 	"strings"
 	"testing"
 )
+
+// runMainEnv, when set, makes the test binary behave as harnesh itself. The
+// terminal tests use it to run the real program on a pseudo-terminal.
+const runMainEnv = "HARNESH_TEST_RUN_MAIN"
+
+func TestMain(m *testing.M) {
+	if os.Getenv(runMainEnv) != "" {
+		os.Unsetenv(runMainEnv)
+		os.Exit(realMain())
+	}
+	os.Exit(m.Run())
+}
 
 func TestCLIArguments(t *testing.T) {
 	t.Run("help flag", func(t *testing.T) {

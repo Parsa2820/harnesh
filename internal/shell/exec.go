@@ -53,6 +53,16 @@ func (s *Shell) shellCommand(ctx context.Context, script string) *exec.Cmd {
 	return cmd
 }
 
+// runJob runs cmd as the user's current foreground job and waits for it. In
+// an interactive session the job gets the terminal to itself (see
+// runForeground); otherwise it simply runs as a child.
+func (s *Shell) runJob(cmd *exec.Cmd) childResult {
+	if tty, ok := s.jobControlTTY(); ok {
+		return runForeground(cmd, tty)
+	}
+	return resultOf(cmd.Run())
+}
+
 // resultOf translates the error from starting or waiting for a child into a
 // shell-style exit status.
 func resultOf(err error) childResult {
@@ -92,7 +102,7 @@ func (s *Shell) runExternalShellCommand(ctx context.Context, cmdLine string) {
 		}
 	}
 
-	res := resultOf(cmd.Run())
+	res := s.runJob(cmd)
 	if res.err != nil {
 		fmt.Fprintf(s.cfg.Err, "harnesh: failed to run %s: %v\n", s.cfg.SystemShell, res.err)
 	}
@@ -120,7 +130,7 @@ func (s *Shell) runAgentPrompt(ctx context.Context, prompt string) {
 	cmd.Stdout = io.MultiWriter(s.cfg.Out, &response)
 	cmd.Stderr = s.cfg.Err
 
-	res := resultOf(cmd.Run())
+	res := s.runJob(cmd)
 	s.lastExitCode = res.code
 	switch {
 	case errors.Is(res.err, syscall.E2BIG):

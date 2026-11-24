@@ -13,10 +13,19 @@ type winsize struct {
 }
 
 func ioctl(fd int, req uintptr, arg unsafe.Pointer) error {
-	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), req, uintptr(arg)); errno != 0 {
-		return errno
+	for {
+		_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), req, uintptr(arg))
+		switch errno {
+		case 0:
+			return nil
+		case syscall.EINTR:
+			// Interrupted by a signal, e.g. after being stopped for
+			// changing terminal settings from the background.
+			continue
+		default:
+			return errno
+		}
 	}
-	return nil
 }
 
 // IsTerminal reports whether fd refers to a terminal. Unlike checking for a
@@ -61,4 +70,22 @@ func Width(fd int) (cols int, ok bool) {
 		return 0, false
 	}
 	return int(ws.Col), true
+}
+
+// ForegroundProcessGroup returns the ID of the process group that currently
+// owns the terminal on fd, i.e. the one that receives keyboard signals.
+func ForegroundProcessGroup(fd int) (int, error) {
+	var pgid int32
+	if err := ioctl(fd, syscall.TIOCGPGRP, unsafe.Pointer(&pgid)); err != nil {
+		return 0, err
+	}
+	return int(pgid), nil
+}
+
+// SetForegroundProcessGroup makes pgid the foreground process group of the
+// terminal on fd. A caller that is itself in the background is sent SIGTTOU
+// instead, unless it ignores that signal.
+func SetForegroundProcessGroup(fd, pgid int) error {
+	id := int32(pgid)
+	return ioctl(fd, syscall.TIOCSPGRP, unsafe.Pointer(&id))
 }
