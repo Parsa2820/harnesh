@@ -120,11 +120,11 @@ func (s *Shell) cdError(msg string) int {
 // in. The shell prints its own diagnostics on failure.
 func (s *Shell) resolveCDWithShell(ctx context.Context, cmdLine string) (dir string, exitCode int) {
 	var stdout bytes.Buffer
-	cmd := s.command(ctx, s.cfg.SystemShell, "-c", cmdLine+" >/dev/null && pwd")
+	cmd := s.shellCommand(ctx, cmdLine+" >/dev/null && pwd")
 	cmd.Stdout = &stdout
 	cmd.Stderr = s.cfg.Err
 
-	res := runChild(cmd)
+	res := resultOf(cmd.Run())
 	if res.err != nil {
 		fmt.Fprintf(s.cfg.Err, "harnesh: cd: failed to run %s: %v\n", s.cfg.SystemShell, res.err)
 		return "", res.code

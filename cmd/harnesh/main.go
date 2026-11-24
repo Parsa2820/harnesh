@@ -47,7 +47,8 @@ Arguments:
 Interactive Commands:
   <prompt>          Send <prompt> to the agent (conversation history is retained).
                     Pasted text may span lines; Alt-Enter inserts a newline.
-  !<command>        Run <command> in your original shell (inheriting its coloring)
+  !<command>        Run <command> in your original shell, with its aliases,
+                    functions, and coloring
   !cd [dir]         Change harnesh's working directory
   !clear            Clear both the terminal screen and the retained conversation
   !exit [code]      Exit harnesh (or press Ctrl-D)
@@ -73,11 +74,12 @@ func realMain() int {
 	defer cancel()
 
 	// SIGTERM and SIGHUP always shut harnesh down. In an interactive session
-	// SIGINT and SIGQUIT (Ctrl-C, Ctrl-\) are meant for the foreground child
-	// (the terminal delivers them to it directly), so harnesh itself ignores
-	// them like any shell; in a piped session they terminate it like any
-	// other program. Handlers are installed with Notify rather than Ignore so
-	// that child processes still start with the default dispositions.
+	// SIGINT and SIGQUIT (Ctrl-C, Ctrl-\) are meant for the foreground job,
+	// which the terminal delivers them to directly, so harnesh itself
+	// disregards them like any shell; in a piped session they terminate it
+	// like any other program. Handlers are installed with Notify rather than
+	// Ignore so that child processes still start with the default
+	// dispositions.
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(signals)
@@ -150,6 +152,7 @@ func run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer
 		fmt.Fprintf(errOut, "harnesh: %v\n", err)
 		return 1
 	}
+	defer sh.Close()
 
 	return sh.Run(ctx)
 }

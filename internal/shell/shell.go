@@ -46,9 +46,10 @@ type Config struct {
 	Err io.Writer
 
 	// Interactive controls whether the shell prints a startup banner and
-	// prompt, probes the original shell's PS1 and color settings, and connects
-	// In directly to !command child processes so interactive terminal programs
-	// (e.g., !vim, !less) work as expected.
+	// prompt, asks the original shell for its prompt, colors, aliases, and
+	// functions, and runs the agent and !commands as foreground jobs on the
+	// terminal In refers to, so that interactive terminal programs (e.g.,
+	// !vim, !less) and Ctrl-C work as they do in a shell.
 	Interactive bool
 
 	// SystemShell is the shell executable used to evaluate !commands via
@@ -56,8 +57,8 @@ type Config struct {
 	// Defaults to DetectOriginalShell() (parent shell, $SHELL, or /bin/sh).
 	SystemShell string
 
-	// PS1 optionally overrides the prompt template instead of reading PS1 from
-	// the environment or probing the original shell.
+	// PS1 optionally overrides the prompt template instead of asking the
+	// original shell for it.
 	PS1 string
 
 	// HistoryFile optionally specifies a file path for loading and persisting
@@ -89,6 +90,8 @@ type Shell struct {
 	prompt       *PromptRenderer
 	editor       *LineEditor  // interactive mode only
 	input        *inputReader // non-interactive mode only
+	colorEnv     []string     // color variables the original shell does not export
+	definitions  *definitions // the original shell's aliases and functions; may be nil
 	conversation Conversation
 	lastExitCode int
 	prevDir      string
@@ -120,10 +123,21 @@ func New(cfg Config) (*Shell, error) {
 		cfg.MaxPromptBytes = DefaultMaxPromptBytes
 	}
 
+	// An interactive session behaves like the user's own shell, so ask that
+	// shell (once) for the configuration its rc files hold. Scripted input
+	// gets the plain, predictable environment a shell script would.
+	kind := shellKindOf(cfg.SystemShell)
+	var profile shellProfile
+	if cfg.Interactive {
+		profile = probeShell(cfg.SystemShell, kind)
+	}
+
 	sh := &Shell{
-		cfg:     cfg,
-		prompt:  NewPromptRenderer(cfg.SystemShell, cfg.PS1, cfg.Interactive),
-		prevDir: os.Getenv("OLDPWD"),
+		cfg:         cfg,
+		prompt:      newPromptRenderer(cfg.SystemShell, cfg.PS1, profile),
+		colorEnv:    profile.colorEnv,
+		definitions: newDefinitions(cfg.SystemShell, kind, profile),
+		prevDir:     os.Getenv("OLDPWD"),
 	}
 	if cfg.Interactive {
 		sh.editor = NewLineEditor(cfg.In, cfg.Out, cfg.HistoryFile)
@@ -131,6 +145,15 @@ func New(cfg Config) (*Shell, error) {
 		sh.input = newInputReader(cfg.In)
 	}
 	return sh, nil
+}
+
+// Close releases the resources held by the Shell. It should be called once
+// the Shell is no longer needed.
+func (s *Shell) Close() {
+	if s.definitions != nil {
+		s.definitions.Close()
+		s.definitions = nil
+	}
 }
 
 // Run starts the read-eval-print loop and blocks until EOF, !exit, or ctx

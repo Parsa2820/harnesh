@@ -38,7 +38,7 @@ func TestRenderZshPS1WithColorAndExitCode(t *testing.T) {
 	}
 
 	ps1 := `%F{cyan}%~ %(?.%F{green}.%F{red})%#%f `
-	r := NewPromptRenderer(zshPath, ps1, false)
+	r := newPromptRenderer(zshPath, ps1, shellProfile{})
 
 	okPrompt := r.Render(context.Background(), 0)
 	if !strings.Contains(okPrompt, "\x1b[36m") || !strings.Contains(okPrompt, "\x1b[32m") {
@@ -87,7 +87,7 @@ func TestRenderDoesNotWaitForBackgroundProcesses(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	r := NewPromptRenderer(fakeZsh, "ignored> ", false)
+	r := newPromptRenderer(fakeZsh, "ignored> ", shellProfile{})
 	start := time.Now()
 	got := r.Render(context.Background(), 0)
 	elapsed := time.Since(start)

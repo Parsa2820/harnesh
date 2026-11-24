@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 )
 
@@ -34,11 +35,27 @@ func (s *Shell) command(ctx context.Context, name string, args ...string) *exec.
 	return cmd
 }
 
-// runChild runs cmd to completion and translates the result into a shell-style
-// exit status.
-func runChild(cmd *exec.Cmd) childResult {
-	err := cmd.Run()
+// shellCommand builds a "<shell> -c <script>" child with the environment
+// !commands run in: the process environment, the original shell's color
+// variables, and the hook that loads the user's aliases and functions.
+func (s *Shell) shellCommand(ctx context.Context, script string) *exec.Cmd {
+	// A script starting with "-" or "+" would be read as more shell options.
+	if strings.HasPrefix(script, "-") || strings.HasPrefix(script, "+") {
+		script = " " + script
+	}
+	cmd := s.command(ctx, s.cfg.SystemShell, "-c", script)
+	if len(s.colorEnv) > 0 || s.definitions != nil {
+		cmd.Env = append(os.Environ(), s.colorEnv...)
+		if s.definitions != nil {
+			cmd.Env = append(cmd.Env, s.definitions.Env()...)
+		}
+	}
+	return cmd
+}
 
+// resultOf translates the error from starting or waiting for a child into a
+// shell-style exit status.
+func resultOf(err error) childResult {
 	var exitErr *exec.ExitError
 	switch {
 	case err == nil, errors.Is(err, exec.ErrWaitDelay):
@@ -61,9 +78,10 @@ func runChild(cmd *exec.Cmd) childResult {
 }
 
 // runExternalShellCommand executes cmdLine using the configured system shell,
-// inheriting any color variables discovered from the original shell.
+// with the color variables, aliases, and functions discovered from the
+// original shell.
 func (s *Shell) runExternalShellCommand(ctx context.Context, cmdLine string) {
-	cmd := s.command(ctx, s.cfg.SystemShell, "-c", cmdLine)
+	cmd := s.shellCommand(ctx, cmdLine)
 	cmd.Stdout = s.cfg.Out
 	cmd.Stderr = s.cfg.Err
 	// Only hand the terminal to the child in interactive sessions; in piped
@@ -73,11 +91,8 @@ func (s *Shell) runExternalShellCommand(ctx context.Context, cmdLine string) {
 			cmd.Stdin = f
 		}
 	}
-	if extra := s.prompt.ColorEnv(); len(extra) > 0 {
-		cmd.Env = append(os.Environ(), extra...)
-	}
 
-	res := runChild(cmd)
+	res := resultOf(cmd.Run())
 	if res.err != nil {
 		fmt.Fprintf(s.cfg.Err, "harnesh: failed to run %s: %v\n", s.cfg.SystemShell, res.err)
 	}
@@ -105,7 +120,7 @@ func (s *Shell) runAgentPrompt(ctx context.Context, prompt string) {
 	cmd.Stdout = io.MultiWriter(s.cfg.Out, &response)
 	cmd.Stderr = s.cfg.Err
 
-	res := runChild(cmd)
+	res := resultOf(cmd.Run())
 	s.lastExitCode = res.code
 	switch {
 	case errors.Is(res.err, syscall.E2BIG):
